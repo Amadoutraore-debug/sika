@@ -936,6 +936,8 @@
     if (/already registered/i.test(m)) return 'Un compte existe déjà avec cet e-mail : connectez-vous';
     if (/at least 6/i.test(m)) return 'Le mot de passe doit contenir au moins 6 caractères';
     if (/rate limit/i.test(m)) return 'Trop de tentatives, réessayez dans quelques minutes';
+    if (/email address .* is invalid/i.test(m)) return 'Adresse e-mail non acceptée, vérifiez-la';
+    if (/error sending|sending .*email/i.test(m)) return 'L\'e-mail de confirmation n\'a pas pu être envoyé, réessayez plus tard';
     if (/failed to fetch|network/i.test(m)) return 'Pas de connexion au serveur. Vérifiez Internet et réessayez';
     return m || 'Erreur de connexion';
   }
