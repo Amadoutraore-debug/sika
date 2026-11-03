@@ -206,7 +206,10 @@
     [/^\/doc\/([\w]+)\/modifier$/, (m) => renderEditor(m[1]), null],
     [/^\/clients$/, renderClients, 'clients'],
     [/^\/client\/([\w]+)$/, (m) => renderClient(m[1]), 'clients'],
-    [/^\/parametres$/, renderSettings, 'parametres']
+    [/^\/parametres$/, renderSettings, 'parametres'],
+    [/^\/boutique$/, () => renderShop(), 'boutique'],
+    [/^\/commandes$/, () => renderOrders(), 'commandes'],
+    [/^\/commande\/([\w-]+)$/, (m) => renderOrder(m[1]), 'commandes']
   ];
 
   function router() {
@@ -291,6 +294,7 @@
     view.innerHTML =
       head(name, new Date().toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }),
         '<a class="btn" href="#/nouveau/devis">' + ICON.plus + 'Devis</a><a class="btn btn-primary" href="#/nouveau/facture">' + ICON.plus + 'Facture</a>') +
+      shopBanner() +
       (!state.company.name ? '<div class="card card-pad" style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><div><div class="strong">Commencez par renseigner votre entreprise</div><div class="muted small">Nom, logo, RCCM, NCC : ils apparaîtront sur vos devis et factures.</div></div><a class="btn btn-gold" href="#/parametres">Configurer</a></div>' : '') +
       '<div class="grid kpis">' +
         '<div class="card kpi accent"><div class="label">Encaissé ce mois</div><div class="value">' + money(cashedMonth) + '</div><div class="hint">' + new Date().toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' }) + '</div></div>' +
@@ -918,6 +922,423 @@
     go('#/');
   }
 
+  // ---------- Boutique en ligne (espace vendeur) ----------
+  const shopData = { loaded: false, shop: null, products: [], orders: [] };
+  const ORDER_STATUS = {
+    nouvelle: { label: 'Nouvelle', cls: 'b-gold' },
+    validee: { label: 'Validée', cls: 'b-blue' },
+    livree: { label: 'Livrée', cls: 'b-green' },
+    annulee: { label: 'Annulée', cls: 'b-gray' }
+  };
+  const orderBadge = (o) => '<span class="badge ' + ORDER_STATUS[o.status].cls + '">' + ORDER_STATUS[o.status].label + '</span>';
+  const fmtDateTime = (ts) => new Date(ts).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const digits = (p) => String(p || '').replace(/\D/g, '');
+  function waNumber(p) { let d = digits(p); if (d.length === 10) d = '225' + d; return d; }
+  function shopUrl(pid) {
+    const base = new URL('boutique.html', location.origin + location.pathname).href;
+    return base + '?b=' + encodeURIComponent(shopData.shop.slug) + (pid ? '&p=' + pid : '');
+  }
+  function slugify(s) {
+    return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+  }
+  async function copyText(text, msg) {
+    try { await navigator.clipboard.writeText(text); toast(msg || 'Lien copié'); }
+    catch (e) { window.prompt('Copiez ce lien :', text); }
+  }
+  const waShare = (text) => window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank', 'noopener');
+
+  async function loadShopData() {
+    if (!CLOUD || !user) return;
+    const { data: shop, error } = await sb.from('shops').select('*').eq('owner', user.id).maybeSingle();
+    if (error) return;
+    shopData.shop = shop;
+    if (shop) {
+      const [p, o] = await Promise.all([
+        sb.from('products').select('*').eq('shop_id', shop.id).order('created_at', { ascending: false }),
+        sb.from('orders').select('*').eq('shop_id', shop.id).order('created_at', { ascending: false }).limit(300)
+      ]);
+      shopData.products = p.data || [];
+      shopData.orders = o.data || [];
+    }
+    shopData.loaded = true;
+    updateOrderBadge();
+  }
+
+  function updateOrderBadge() {
+    const n = shopData.orders.filter((o) => o.status === 'nouvelle').length;
+    $$('.nav [data-count]').forEach((el) => { el.textContent = n; el.hidden = !n; });
+  }
+
+  // Nouvelles commandes : vérification toutes les minutes quand la page est visible
+  setInterval(async () => {
+    if (!user || !shopData.shop || document.visibilityState !== 'visible') return;
+    const before = shopData.orders.filter((o) => o.status === 'nouvelle').length;
+    const { data } = await sb.from('orders').select('*').eq('shop_id', shopData.shop.id).order('created_at', { ascending: false }).limit(300);
+    if (!data) return;
+    shopData.orders = data;
+    updateOrderBadge();
+    const after = data.filter((o) => o.status === 'nouvelle').length;
+    if (after > before) {
+      toast(after - before > 1 ? (after - before) + ' nouvelles commandes !' : 'Nouvelle commande reçue !');
+      if (/^#\/(commandes)?$/.test(location.hash) || location.hash === '') router();
+    }
+  }, 60000);
+
+  function needShop(view, render) {
+    if (!CLOUD || !user) {
+      view.innerHTML = head('Boutique en ligne') + '<div class="card empty"><div class="big">Connexion requise</div>La boutique en ligne nécessite un compte.</div>';
+      return false;
+    }
+    if (!shopData.loaded) {
+      view.innerHTML = '<div class="empty">Chargement…</div>';
+      const h = location.hash;
+      loadShopData().then(() => { if (location.hash === h) render(); });
+      return false;
+    }
+    return true;
+  }
+
+  function shopBanner() {
+    if (!CLOUD || !user || !shopData.loaded) return '';
+    if (!shopData.shop) {
+      return '<div class="card card-pad shop-cta"><div><div class="strong">Créez votre boutique en ligne</div><div class="muted small">Ajoutez vos produits, partagez le lien à vos contacts, recevez les commandes et facturez en un clic.</div></div><a class="btn btn-gold" href="#/boutique">Créer ma boutique</a></div>';
+    }
+    const fresh = shopData.orders.filter((o) => o.status === 'nouvelle');
+    if (!fresh.length) return '';
+    const sum = fresh.reduce((s, o) => s + Number(o.total), 0);
+    return '<a class="card card-pad shop-cta new-orders" href="#/commandes"><div><div class="strong">' + fresh.length + ' nouvelle' + (fresh.length > 1 ? 's commandes' : ' commande') + ' à traiter</div><div class="muted small">' + money(sum) + ' en attente de validation</div></div><span class="btn btn-primary">Voir</span></a>';
+  }
+
+  async function resizeToBlob(file, maxSide) {
+    const url = URL.createObjectURL(file);
+    try {
+      const imgEl = await new Promise((resolve, reject) => { const i = new Image(); i.onload = () => resolve(i); i.onerror = reject; i.src = url; });
+      const scale = Math.min(1, maxSide / Math.max(imgEl.width, imgEl.height));
+      const cv = document.createElement('canvas');
+      cv.width = Math.round(imgEl.width * scale); cv.height = Math.round(imgEl.height * scale);
+      const ctx = cv.getContext('2d');
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.drawImage(imgEl, 0, 0, cv.width, cv.height);
+      return await new Promise((resolve) => cv.toBlob(resolve, 'image/jpeg', 0.84));
+    } finally { URL.revokeObjectURL(url); }
+  }
+
+  async function uploadImage(file, prefix) {
+    const blob = await resizeToBlob(file, prefix === 'logo' ? 400 : 1000);
+    const path = user.id + '/' + prefix + '-' + uid() + '.jpg';
+    const { error } = await sb.storage.from('produits').upload(path, blob, { contentType: 'image/jpeg' });
+    if (error) throw error;
+    return sb.storage.from('produits').getPublicUrl(path).data.publicUrl;
+  }
+
+  function removeImage(url) {
+    const marker = '/object/public/produits/';
+    if (!url || url.indexOf(marker) < 0) return;
+    sb.storage.from('produits').remove([decodeURIComponent(url.split(marker)[1])]);
+  }
+
+  // Page « Ma boutique »
+  function renderShop() {
+    const view = $('#view');
+    if (!needShop(view, renderShop)) return;
+    const shop = shopData.shop;
+    if (!shop) return renderShopCreate(view);
+
+    const prods = shopData.products;
+    view.innerHTML =
+      head('Ma boutique', esc(shop.name) + (shop.active ? '' : ' · <span class="badge b-gray">Fermée</span>'),
+        '<button class="btn" id="shop-settings">' + ICON.edit + 'Paramètres</button><a class="btn" target="_blank" rel="noopener" href="' + esc(shopUrl()) + '">Voir ma boutique</a>') +
+      '<div class="card card-pad share-box"><div class="share-text"><div class="strong">Lien de votre boutique</div><div class="muted small">Envoyez-le à vos contacts, mettez-le en statut WhatsApp ou sur Facebook.</div>' +
+        '<div class="link-field"><input type="text" readonly value="' + esc(shopUrl()) + '" aria-label="Lien de la boutique"></div></div>' +
+        '<div class="head-actions"><button class="btn btn-primary" id="copy-shop">' + ICON.copy + 'Copier le lien</button><button class="btn" id="wa-shop">' + ICON.wa + 'Partager sur WhatsApp</button></div></div>' +
+      '<div class="page-head" style="margin:24px 0 14px"><div><h1 style="font-size:20px">Produits</h1><p class="sub">' + prods.length + ' produit' + (prods.length > 1 ? 's' : '') + ' · ' + prods.filter((p) => p.active).length + ' en vente</p></div>' +
+        '<div class="head-actions"><button class="btn btn-gold" id="add-product">' + ICON.plus + 'Ajouter un produit</button></div></div>' +
+      (prods.length
+        ? '<div class="seller-products">' + prods.map((p) =>
+            '<div class="card sp-card' + (p.active ? '' : ' off') + '">' +
+              '<div class="sp-img">' + (p.image_url ? '<img src="' + esc(p.image_url) + '" alt="" loading="lazy">' : '<span>' + esc((p.name[0] || '?').toUpperCase()) + '</span>') +
+                (!p.active ? '<span class="badge b-gray sp-flag">Masqué</span>' : p.stock === 0 ? '<span class="badge b-red sp-flag">Épuisé</span>' : '') + '</div>' +
+              '<div class="sp-body"><div class="strong sp-name">' + esc(p.name) + '</div>' +
+                '<div class="sp-price">' + money(p.price) + (p.old_price && Number(p.old_price) > Number(p.price) ? ' <s class="muted small">' + money(p.old_price) + '</s>' : '') + '</div>' +
+                '<div class="muted small">' + (p.stock == null ? 'Stock illimité' : 'Stock : ' + p.stock) + '</div>' +
+                '<div class="sp-actions"><button class="btn btn-sm" data-edit="' + p.id + '">' + ICON.edit + 'Modifier</button>' +
+                  '<button class="btn btn-sm icon-btn" data-copy="' + p.id + '" aria-label="Copier le lien du produit" title="Copier le lien">' + ICON.copy + '</button>' +
+                  '<button class="btn btn-sm icon-btn" data-wa="' + p.id + '" aria-label="Partager sur WhatsApp" title="Partager sur WhatsApp">' + ICON.wa + '</button></div>' +
+              '</div></div>').join('') + '</div>'
+        : '<div class="card empty"><div class="big">Aucun produit</div>Ajoutez votre premier produit : photo, nom et prix suffisent.<br><button class="btn btn-gold" id="add-product-2">' + ICON.plus + 'Ajouter un produit</button></div>');
+
+    $('#copy-shop', view).onclick = () => copyText(shopUrl());
+    $('#wa-shop', view).onclick = () => waShare('Découvrez ma boutique ' + shop.name + ' et commandez directement en ligne 👉 ' + shopUrl());
+    $('#shop-settings', view).onclick = shopSettingsModal;
+    $('#add-product', view).onclick = () => productModal(null);
+    const add2 = $('#add-product-2', view);
+    if (add2) add2.onclick = () => productModal(null);
+    $$('[data-edit]', view).forEach((b) => b.onclick = () => productModal(prods.find((p) => p.id === b.dataset.edit)));
+    $$('[data-copy]', view).forEach((b) => b.onclick = () => copyText(shopUrl(b.dataset.copy), 'Lien du produit copié'));
+    $$('[data-wa]', view).forEach((b) => b.onclick = () => {
+      const p = prods.find((x) => x.id === b.dataset.wa);
+      waShare(p.name + ' à ' + money(p.price) + ' chez ' + shop.name + '. Commandez ici 👉 ' + shopUrl(p.id));
+    });
+  }
+
+  function renderShopCreate(view) {
+    const c = state.company;
+    view.innerHTML = head('Créer ma boutique', 'Quelques informations et votre boutique est en ligne') +
+      '<form id="shf" class="card card-pad" style="max-width:640px"><div class="form-grid">' +
+        '<div class="field full"><label for="sh-name">Nom de la boutique *</label><input type="text" id="sh-name" required maxlength="80" value="' + esc(c.name) + '" placeholder="Ex. : Awa Mode"></div>' +
+        '<div class="field full"><label for="sh-slug">Adresse de la boutique *</label><div class="slug-field"><span>…/boutique.html?b=</span><input type="text" id="sh-slug" required maxlength="40" value="' + esc(slugify(c.name)) + '"></div><div class="muted small" style="margin-top:4px">Lettres minuscules, chiffres et tirets (3 caractères minimum).</div></div>' +
+        '<div class="field"><label for="sh-phone">Numéro WhatsApp *</label><input type="tel" id="sh-phone" required value="' + esc(c.phone) + '" placeholder="07 00 00 00 00"></div>' +
+        '<div class="field"><label for="sh-city">Ville</label><input type="text" id="sh-city" value="' + esc(c.city) + '"></div>' +
+      '</div><button class="btn btn-gold" style="margin-top:18px">' + ICON.check + 'Créer ma boutique</button><p class="auth-msg small" id="sh-msg"></p></form>';
+    const name = $('#sh-name', view), slugIn = $('#sh-slug', view);
+    let touched = false;
+    name.oninput = () => { if (!touched) slugIn.value = slugify(name.value); };
+    slugIn.oninput = () => { touched = true; slugIn.value = slugify(slugIn.value); };
+    $('#shf', view).onsubmit = async (e) => {
+      e.preventDefault();
+      const msg = $('#sh-msg', view);
+      const slug = slugify(slugIn.value);
+      if (slug.length < 3) { msg.textContent = 'L\'adresse doit contenir au moins 3 caractères'; return; }
+      if (digits($('#sh-phone', view).value).length < 8) { msg.textContent = 'Numéro WhatsApp invalide'; return; }
+      msg.className = 'auth-msg small ok'; msg.textContent = 'Création…';
+      const { data, error } = await sb.from('shops').insert({
+        owner: user.id, slug, name: name.value.trim(), phone: $('#sh-phone', view).value.trim(), city: $('#sh-city', view).value.trim(),
+        delivery: 'Livraison possible. Paiement à la livraison ou par Mobile Money.'
+      }).select().single();
+      if (error) {
+        msg.className = 'auth-msg small';
+        msg.textContent = error.code === '23505' ? (/slug/.test(error.message) ? 'Cette adresse est déjà prise, choisissez-en une autre' : 'Vous avez déjà une boutique') : 'Erreur : ' + error.message;
+        return;
+      }
+      shopData.shop = data; shopData.products = []; shopData.orders = [];
+      toast('Boutique créée !');
+      renderShop();
+    };
+  }
+
+  function shopSettingsModal() {
+    const s = shopData.shop;
+    openModal('<form id="ssf"><div class="modal-head"><h3>Paramètres de la boutique</h3><button type="button" class="btn btn-ghost icon-btn" data-close aria-label="Fermer">' + ICON.close + '</button></div>' +
+      '<div class="modal-content"><div class="form-grid">' +
+        '<div class="field full"><label>Logo</label><div class="logo-preview">' + (s.logo_url ? '<img src="' + esc(s.logo_url) + '" alt="Logo" id="ss-logo-img">' : '<span class="muted small" id="ss-logo-img">Aucun logo</span>') +
+          '<label class="btn" style="margin:0">Choisir<input type="file" id="ss-logo" accept="image/*" hidden></label></div></div>' +
+        '<div class="field full"><label for="ss-name">Nom</label><input type="text" id="ss-name" maxlength="80" value="' + esc(s.name) + '"></div>' +
+        '<div class="field full"><label for="ss-desc">Présentation</label><textarea id="ss-desc" rows="3" placeholder="Ce que vous vendez, vos horaires…">' + esc(s.description) + '</textarea></div>' +
+        '<div class="field"><label for="ss-phone">WhatsApp</label><input type="tel" id="ss-phone" value="' + esc(s.phone) + '"></div>' +
+        '<div class="field"><label for="ss-city">Ville</label><input type="text" id="ss-city" value="' + esc(s.city) + '"></div>' +
+        '<div class="field full"><label for="ss-delivery">Livraison et paiement (affiché aux clients)</label><input type="text" id="ss-delivery" value="' + esc(s.delivery) + '"></div>' +
+        '<label class="check-row full"><input type="checkbox" id="ss-active"' + (s.active ? ' checked' : '') + '> Boutique ouverte (visible par les clients)</label>' +
+      '</div></div>' +
+      '<div class="modal-foot"><button type="button" class="btn" data-close>Annuler</button><button class="btn btn-primary">Enregistrer</button></div></form>');
+    let logoUrl = s.logo_url;
+    $('#ss-logo').onchange = async (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      toast('Envoi du logo…');
+      try {
+        logoUrl = await uploadImage(f, 'logo');
+        $('#ss-logo-img').outerHTML = '<img src="' + esc(logoUrl) + '" alt="Logo" id="ss-logo-img">';
+      } catch (err) { toast('Envoi du logo impossible'); }
+    };
+    $('#ssf').onsubmit = async (e) => {
+      e.preventDefault();
+      const patch = {
+        name: $('#ss-name').value.trim() || s.name, description: $('#ss-desc').value.trim(), phone: $('#ss-phone').value.trim(),
+        city: $('#ss-city').value.trim(), delivery: $('#ss-delivery').value.trim(), active: $('#ss-active').checked, logo_url: logoUrl
+      };
+      const { data, error } = await sb.from('shops').update(patch).eq('id', s.id).select().single();
+      if (error) { toast('Erreur : ' + error.message); return; }
+      if (s.logo_url && s.logo_url !== logoUrl) removeImage(s.logo_url);
+      shopData.shop = data;
+      closeModal(); toast('Boutique mise à jour'); renderShop();
+    };
+  }
+
+  function productModal(p) {
+    const isNew = !p;
+    p = p || { name: '', price: '', old_price: null, stock: null, description: '', image_url: '', active: true };
+    let imageUrl = p.image_url;
+    let file = null;
+    openModal('<form id="pf2"><div class="modal-head"><h3>' + (isNew ? 'Nouveau produit' : 'Modifier le produit') + '</h3><button type="button" class="btn btn-ghost icon-btn" data-close aria-label="Fermer">' + ICON.close + '</button></div>' +
+      '<div class="modal-content"><div class="form-grid">' +
+        '<div class="field full"><label>Photo</label><label class="photo-pick" id="pp">' + (imageUrl ? '<img src="' + esc(imageUrl) + '" alt="">' : '<span>+ Ajouter une photo</span>') + '<input type="file" id="pp-file" accept="image/*" hidden></label></div>' +
+        '<div class="field full"><label for="pp-name">Nom du produit *</label><input type="text" id="pp-name" required maxlength="120" value="' + esc(p.name) + '"></div>' +
+        '<div class="field"><label for="pp-price">Prix (FCFA) *</label><input type="number" id="pp-price" min="0" step="1" required value="' + esc(p.price) + '"></div>' +
+        '<div class="field"><label for="pp-old">Ancien prix (barré)</label><input type="number" id="pp-old" min="0" step="1" value="' + esc(p.old_price == null ? '' : p.old_price) + '" placeholder="Facultatif"></div>' +
+        '<div class="field"><label for="pp-stock">Stock</label><input type="number" id="pp-stock" min="0" step="1" value="' + esc(p.stock == null ? '' : p.stock) + '" placeholder="Vide = illimité"></div>' +
+        '<label class="check-row" style="align-self:end"><input type="checkbox" id="pp-active"' + (p.active ? ' checked' : '') + '> En vente</label>' +
+        '<div class="field full"><label for="pp-desc">Description</label><textarea id="pp-desc" rows="3" placeholder="Taille, couleur, matière…">' + esc(p.description) + '</textarea></div>' +
+      '</div></div>' +
+      '<div class="modal-foot">' + (isNew ? '' : '<button type="button" class="btn btn-danger" id="pp-del" style="margin-right:auto">' + ICON.trash + 'Supprimer</button>') +
+        '<button type="button" class="btn" data-close>Annuler</button><button class="btn btn-primary">Enregistrer</button></div></form>');
+    $('#pp-file').onchange = (e) => {
+      file = e.target.files[0];
+      if (!file) return;
+      const prev = URL.createObjectURL(file);
+      $('#pp').firstChild.outerHTML = '<img src="' + prev + '" alt="">';
+    };
+    const del = $('#pp-del');
+    if (del) del.onclick = () => confirmModal('Supprimer « ' + p.name + ' » ?', 'Le produit disparaîtra de votre boutique. Les commandes déjà passées restent intactes.', 'Supprimer', async () => {
+      const { error } = await sb.from('products').delete().eq('id', p.id);
+      if (error) { toast('Erreur : ' + error.message); return; }
+      removeImage(p.image_url);
+      shopData.products = shopData.products.filter((x) => x.id !== p.id);
+      toast('Produit supprimé'); renderShop();
+    });
+    $('#pf2').onsubmit = async (e) => {
+      e.preventDefault();
+      const btn = $('#pf2 .modal-foot .btn-primary');
+      const name = $('#pp-name').value.trim();
+      const price = num($('#pp-price').value);
+      if (!name) { toast('Le nom est obligatoire'); return; }
+      const oldRaw = $('#pp-old').value.trim(), stockRaw = $('#pp-stock').value.trim();
+      btn.disabled = true; btn.textContent = 'Enregistrement…';
+      try {
+        if (file) imageUrl = await uploadImage(file, 'produit');
+      } catch (err) {
+        btn.disabled = false; btn.textContent = 'Enregistrer';
+        toast('Envoi de la photo impossible'); return;
+      }
+      const row = {
+        name, price: Math.round(price), old_price: oldRaw ? Math.round(num(oldRaw)) : null,
+        stock: stockRaw === '' ? null : Math.max(0, Math.round(num(stockRaw))),
+        description: $('#pp-desc').value.trim(), active: $('#pp-active').checked, image_url: imageUrl || ''
+      };
+      const q = isNew
+        ? sb.from('products').insert(Object.assign({ shop_id: shopData.shop.id }, row)).select().single()
+        : sb.from('products').update(row).eq('id', p.id).select().single();
+      const { data, error } = await q;
+      if (error) { btn.disabled = false; btn.textContent = 'Enregistrer'; toast('Erreur : ' + error.message); return; }
+      if (!isNew && p.image_url && p.image_url !== imageUrl) removeImage(p.image_url);
+      if (isNew) shopData.products.unshift(data);
+      else shopData.products = shopData.products.map((x) => (x.id === data.id ? data : x));
+      closeModal(); toast(isNew ? 'Produit ajouté à la boutique' : 'Produit modifié'); renderShop();
+    };
+  }
+
+  // Page « Commandes »
+  let orderFilter = 'nouvelle';
+  function renderOrders() {
+    const view = $('#view');
+    if (!needShop(view, renderOrders)) return;
+    if (!shopData.shop) return renderShop();
+    const all = shopData.orders;
+    const counts = {};
+    all.forEach((o) => { counts[o.status] = (counts[o.status] || 0) + 1; });
+    const filters = [['nouvelle', 'Nouvelles'], ['validee', 'Validées'], ['livree', 'Livrées'], ['annulee', 'Annulées'], ['toutes', 'Toutes']];
+    const rows = all.filter((o) => orderFilter === 'toutes' || o.status === orderFilter);
+    view.innerHTML = head('Commandes', all.length + ' commande' + (all.length > 1 ? 's' : '') + ' reçue' + (all.length > 1 ? 's' : '') + ' sur votre boutique',
+      '<button class="btn" id="refresh-orders">Actualiser</button>') +
+      '<div class="chips" style="margin-bottom:14px">' + filters.map(([k, l]) => '<button class="chip' + (orderFilter === k ? ' active' : '') + '" data-f="' + k + '">' + l + (counts[k] ? ' (' + counts[k] + ')' : '') + '</button>').join('') + '</div>' +
+      '<div class="card">' + (rows.length
+        ? '<table class="table table-desktop"><thead><tr><th>N°</th><th>Client</th><th>Date</th><th>Articles</th><th class="num">Total</th><th>Statut</th></tr></thead><tbody>' +
+            rows.map((o) => '<tr class="clickable" data-id="' + o.id + '"><td class="strong">#' + o.number + '</td><td>' + esc(o.customer_name) + '<div class="muted small">' + esc(o.customer_phone) + '</div></td><td>' + fmtDateTime(o.created_at) + '</td><td>' + o.items.reduce((s, i) => s + i.qty, 0) + '</td><td class="num strong">' + money(o.total) + '</td><td>' + orderBadge(o) + (o.invoice_number ? ' <span class="badge b-green">Facturée</span>' : '') + '</td></tr>').join('') +
+          '</tbody></table><div class="list-mobile">' +
+            rows.map((o) => '<a class="row-card" href="#/commande/' + o.id + '"><div><div class="strong">#' + o.number + ' · ' + esc(o.customer_name) + '</div><div class="muted small">' + fmtDateTime(o.created_at) + '</div></div><div class="r"><div class="strong">' + money(o.total) + '</div>' + orderBadge(o) + '</div></a>').join('') + '</div>'
+        : '<div class="empty"><div class="big">' + (all.length ? 'Aucune commande dans cette catégorie' : 'Pas encore de commande') + '</div>' +
+            (all.length ? '' : 'Partagez le lien de votre boutique pour recevoir vos premières commandes.<br><a class="btn btn-primary" href="#/boutique">Partager ma boutique</a>') + '</div>') +
+      '</div>';
+    $$('.chip', view).forEach((c) => c.onclick = () => { orderFilter = c.dataset.f; renderOrders(); });
+    $$('tr[data-id]', view).forEach((tr) => tr.onclick = () => go('#/commande/' + tr.dataset.id));
+    $('#refresh-orders', view).onclick = async () => { shopData.loaded = false; await loadShopData(); renderOrders(); toast('Commandes à jour'); };
+  }
+
+  function renderOrder(id) {
+    const view = $('#view');
+    if (!needShop(view, () => renderOrder(id))) return;
+    const o = shopData.orders.find((x) => x.id === id);
+    if (!o) return go('#/commandes');
+    const invoice = state.docs.find((d) => d.orderId === o.id);
+    const statusMsg = {
+      nouvelle: 'Bonjour ' + o.customer_name + ', nous avons bien reçu votre commande n° ' + o.number + ' (' + money(o.total) + ') sur ' + shopData.shop.name + '.',
+      validee: 'Bonjour ' + o.customer_name + ', votre commande n° ' + o.number + ' est confirmée (' + money(o.total) + '). Nous vous contactons pour la livraison.',
+      livree: 'Bonjour ' + o.customer_name + ', merci pour votre achat chez ' + shopData.shop.name + ' ! À bientôt.',
+      annulee: 'Bonjour ' + o.customer_name + ', votre commande n° ' + o.number + ' a été annulée.'
+    }[o.status];
+
+    const actions = [];
+    if (o.status !== 'annulee' && !invoice) actions.push('<button class="btn btn-gold" data-o="invoice">' + ICON.money + 'Créer la facture</button>');
+    if (invoice) actions.push('<a class="btn btn-gold" href="#/doc/' + invoice.id + '">Voir la facture ' + esc(invoice.number) + '</a>');
+    if (o.status === 'nouvelle') actions.push('<button class="btn btn-primary" data-o="validee">' + ICON.check + 'Valider la commande</button>');
+    if (o.status === 'validee') actions.push('<button class="btn btn-primary" data-o="livree">' + ICON.check + 'Marquer comme livrée</button>');
+    actions.push('<a class="btn" target="_blank" rel="noopener" href="https://wa.me/' + waNumber(o.customer_phone) + '?text=' + encodeURIComponent(statusMsg) + '">' + ICON.wa + 'Écrire au client</a>');
+    actions.push('<a class="btn" href="tel:' + esc(o.customer_phone.replace(/\s/g, '')) + '">Appeler</a>');
+    if (o.status === 'nouvelle' || o.status === 'validee') actions.push('<button class="btn btn-danger" data-o="annulee">' + ICON.close + 'Annuler la commande</button>');
+
+    view.innerHTML = head('Commande #' + o.number, orderBadge(o) + ' &nbsp;' + fmtDateTime(o.created_at), '<a class="btn" href="#/commandes">← Retour</a>') +
+      '<div class="doc-layout">' +
+        '<div class="grid">' +
+          '<div class="card card-pad"><h2>Client</h2><div class="strong" style="font-size:17px">' + esc(o.customer_name) + '</div>' +
+            '<div>' + esc(o.customer_phone) + '</div>' +
+            (o.customer_address ? '<div class="muted" style="margin-top:6px">📍 ' + esc(o.customer_address) + '</div>' : '') +
+            (o.note ? '<div class="order-note">' + esc(o.note) + '</div>' : '') + '</div>' +
+          '<div class="card"><table class="table"><thead><tr><th>Produit</th><th class="num">Qté</th><th class="num">Prix</th><th class="num">Montant</th></tr></thead><tbody>' +
+            o.items.map((i) => '<tr><td>' + esc(i.name) + '</td><td class="num">' + i.qty + '</td><td class="num">' + money(i.price) + '</td><td class="num strong">' + money(i.price * i.qty) + '</td></tr>').join('') +
+            '<tr><td colspan="3" class="strong">Total</td><td class="num strong" style="font-size:17px">' + money(o.total) + '</td></tr></tbody></table></div>' +
+        '</div>' +
+        '<div class="doc-side"><div class="card card-pad"><h2>Actions</h2><div class="action-list">' + actions.join('') + '</div></div></div>' +
+      '</div>';
+
+    $$('[data-o]', view).forEach((b) => b.onclick = async () => {
+      const a = b.dataset.o;
+      if (a === 'invoice') return invoiceFromOrder(o);
+      const apply = async () => {
+        const { data, error } = await sb.from('orders').update({ status: a }).eq('id', o.id).select().single();
+        if (error) { toast('Erreur : ' + error.message); return; }
+        Object.assign(o, data);
+        if (a === 'annulee') loadShopData();
+        updateOrderBadge();
+        toast({ validee: 'Commande validée', livree: 'Commande livrée', annulee: 'Commande annulée' }[a]);
+        renderOrder(o.id);
+      };
+      if (a === 'annulee') confirmModal('Annuler la commande #' + o.number + ' ?', 'Les quantités seront remises en stock.', 'Annuler la commande', apply);
+      else apply();
+    });
+  }
+
+  async function invoiceFromOrder(o) {
+    // Entreprise pas encore renseignée : on reprend les infos de la boutique
+    const c = state.company, s = shopData.shop;
+    if (!c.name) Object.assign(c, { name: s.name, phone: c.phone || s.phone, city: s.city || c.city, logo: c.logo || '' });
+    // Client : retrouvé par son numéro, sinon créé
+    let client = state.clients.find((c) => digits(c.phone) && digits(c.phone).slice(-8) === digits(o.customer_phone).slice(-8));
+    if (!client) {
+      client = { id: uid(), name: o.customer_name, contact: '', phone: o.customer_phone, email: '', ncc: '', address: o.customer_address, createdAt: Date.now() };
+      state.clients.push(client);
+    }
+    const doc = {
+      id: uid(), type: 'facture', clientId: client.id, date: today(), due: today(),
+      subject: 'Commande n° ' + o.number + ' — boutique en ligne',
+      items: o.items.map((i) => ({ desc: i.name, qty: i.qty, price: Number(i.price) })),
+      discount: 0, tva: 0, notes: state.company.invoiceNotes, status: 'envoyee', payments: [], orderId: o.id,
+      createdAt: Date.now(), updatedAt: Date.now()
+    };
+    doc.number = nextNumber('facture', doc.date);
+    state.docs.push(doc);
+    save();
+    const patch = { invoice_number: doc.number };
+    if (o.status === 'nouvelle') patch.status = 'validee';
+    const { data } = await sb.from('orders').update(patch).eq('id', o.id).select().single();
+    if (data) Object.assign(o, data);
+    updateOrderBadge();
+    toast('Facture ' + doc.number + ' créée');
+    go('#/doc/' + doc.id);
+  }
+
+  // Menu « Plus » sur mobile
+  document.addEventListener('click', (e) => {
+    const more = e.target.closest('[data-more]');
+    if (!more) return;
+    e.preventDefault();
+    openModal('<div class="modal-head"><h3>Menu</h3><button class="btn btn-ghost icon-btn" data-close aria-label="Fermer">' + ICON.close + '</button></div>' +
+      '<div class="modal-content more-menu">' +
+        '<a class="btn" href="#/devis">Devis</a><a class="btn" href="#/clients">Clients</a><a class="btn" href="#/parametres">Réglages</a>' +
+        (user ? '<button class="btn btn-danger" id="more-logout">Se déconnecter</button>' : '') + '</div>');
+    const lo = $('#more-logout');
+    if (lo) lo.onclick = () => { closeModal(); logout(); };
+  });
+
   // ---------- Comptes (mode en ligne) ----------
   function loadScript(src) {
     return new Promise((resolve, reject) => {
@@ -948,7 +1369,7 @@
     const signup = mode === 'signup';
     $('#view').innerHTML =
       '<div class="auth"><div class="auth-brand"><span class="brand-mark" aria-hidden="true"></span><span>Sika</span></div>' +
-      '<p class="muted" style="text-align:center;margin:0 0 20px">Devis, factures et paiements en FCFA</p>' +
+      '<p class="muted" style="text-align:center;margin:0 0 20px">Votre boutique en ligne, vos commandes et vos factures au même endroit</p>' +
       '<form id="af" class="card card-pad"><h2>' + (signup ? 'Créer un compte' : 'Connexion') + '</h2>' +
         '<div class="field" style="margin-bottom:12px"><label for="a-email">E-mail</label><input type="email" id="a-email" autocomplete="email" required></div>' +
         '<div class="field" style="margin-bottom:16px"><label for="a-pass">Mot de passe</label><input type="password" id="a-pass" autocomplete="' + (signup ? 'new-password' : 'current-password') + '" minlength="6" required></div>' +
@@ -1021,6 +1442,7 @@
       save();
     }
     router();
+    loadShopData().then(() => { if (['', '#', '#/'].includes(location.hash)) router(); });
   }
 
   async function logout() {
@@ -1058,6 +1480,8 @@
       if (event === 'SIGNED_IN' && session && !user) enter(session.user);
       if (event === 'SIGNED_OUT') {
         user = null; storeKey = STORE_KEY; state = defaultState();
+        Object.assign(shopData, { loaded: false, shop: null, products: [], orders: [] });
+        updateOrderBadge();
         setSync(); renderAuth();
       }
     });
